@@ -4949,6 +4949,126 @@ void pre_ft8_check(char* message) {
 	It also handles many commands that don't map to a control
 	like metercal or txcal, etc.
 */
+/* ─── WiFi management ───────────────────────────────────────────────────── */
+
+/* Sends a status string back to the zBitx front panel */
+static void zbitx_send_wifi_status(const char *msg){
+	if (!zbitx_available)
+		return;
+	char buff[200];
+	snprintf(buff, sizeof(buff), "WIFI_STATUS %s}", msg);
+	i2cbb_write_i2c_block_data(ZBITX_I2C_ADDRESS, '{', strlen(buff), buff);
+}
+
+/* Stores SSID/pass temporarily until WIFI_SAVE arrives */
+static char wifi_ssid_pending[64] = {0};
+static char wifi_pass_pending[64] = {0};
+
+static void zbitx_send_wifi_ip();
+static void wifi_connect(){
+	char cmd[300];
+	char result[256] = {0};
+
+	if (!strlen(wifi_ssid_pending)){
+		zbitx_send_wifi_status("Error: no SSID");
+		return;
+	}
+
+	zbitx_send_wifi_status("Connecting...");
+
+	/* Try nmcli first (NetworkManager, default on Pi OS Bookworm) */
+	/* Delete old connection with same SSID if it exists */
+	snprintf(cmd, sizeof(cmd),
+		"nmcli connection delete \"%s\" 2>/dev/null; "
+		"nmcli device wifi connect \"%s\" password \"%s\" 2>&1 | head -1",
+		wifi_ssid_pending, wifi_ssid_pending, wifi_pass_pending);
+
+	FILE *pf = popen(cmd, "r");
+	if (pf){
+		fgets(result, sizeof(result), pf);
+		pclose(pf);
+		/* Trim newline */
+		char *nl = strchr(result, '\n');
+		if (nl) *nl = 0;
+	}
+
+	/* Check if connected - get IP */
+	char ip[64] = {0};
+	FILE *pf2 = popen("hostname -I 2>/dev/null | awk '{print $1}'", "r");
+	if (pf2){
+		fgets(ip, sizeof(ip), pf2);
+		pclose(pf2);
+		char *nl = strchr(ip, '\n');
+		if (nl) *nl = 0;
+	}
+
+	char status[128];
+	if (strlen(ip) > 4)
+		snprintf(status, sizeof(status), "OK IP:%s", ip);
+	else if (strlen(result) > 0)
+		snprintf(status, sizeof(status), "Failed: %.80s", result);
+	else
+		snprintf(status, sizeof(status), "Failed: no IP");
+
+	zbitx_send_wifi_status(status);
+	printf("WiFi: %s\n", status);
+	// wyślij aktualne IP do pola WIFI_IP
+	zbitx_send_wifi_ip();
+}
+
+static void wifi_off(){
+	system("nmcli radio wifi off 2>/dev/null || rfkill block wifi 2>/dev/null");
+	zbitx_send_wifi_status("WiFi off");
+	printf("WiFi: turned off\n");
+}
+
+/* Sends current IP to front panel WIFI_IP field */
+static void zbitx_send_wifi_ip(){
+	if (!zbitx_available) return;
+	char ip[64] = {0};
+	FILE *pf = popen("hostname -I 2>/dev/null | awk '{print $1}'", "r");
+	if (pf){ fgets(ip, sizeof(ip), pf); pclose(pf); }
+	char *nl = strchr(ip, '\n'); if (nl) *nl = 0;
+	char buff[128];
+	if (strlen(ip) > 4)
+		snprintf(buff, sizeof(buff), "WIFI_IP IP: %s}", ip);
+	else
+		snprintf(buff, sizeof(buff), "WIFI_IP Not connected}");
+	i2cbb_write_i2c_block_data(ZBITX_I2C_ADDRESS, '{', strlen(buff), buff);
+}
+
+/* Scans WiFi and sends pipe-separated SSIDs to front panel */
+static void wifi_scan(){
+	zbitx_send_wifi_status("Scanning...");
+	FILE *pf = popen("nmcli -t -f SSID dev wifi list 2>/dev/null | grep -v '^$' | sort -u | head -20", "r");
+	if (!pf){ zbitx_send_wifi_status("Scan failed"); return; }
+	char result[1024] = "WIFI_LIST ";
+	char line[128];
+	int count = 0;
+	while (fgets(line, sizeof(line), pf)){
+		char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+		if (strlen(line) == 0) continue;
+		if (count > 0) strncat(result, "|", sizeof(result)-strlen(result)-1);
+		strncat(result, line, sizeof(result)-strlen(result)-1);
+		count++;
+	}
+	pclose(pf);
+	strncat(result, "}", sizeof(result)-strlen(result)-1);
+	if (count == 0){
+		zbitx_send_wifi_status("No networks found");
+		char empty[] = "WIFI_LIST }";
+		i2cbb_write_i2c_block_data(ZBITX_I2C_ADDRESS, '{', strlen(empty), empty);
+	} else {
+		i2cbb_write_i2c_block_data(ZBITX_I2C_ADDRESS, '{', strlen(result), result);
+		char status[64];
+		snprintf(status, sizeof(status), "Found %d networks", count);
+		zbitx_send_wifi_status(status);
+	}
+	printf("WiFi scan: %d networks\n", count);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+
 void cmd_exec(char *cmd){
 	int i, j;
 	int mode = mode_id(get_field("r1:mode")->value);
@@ -5148,6 +5268,26 @@ void cmd_exec(char *cmd){
 		//macro_exec(atoi(exec+1), buff);
 		//if (strlen(buff))
 		//	set_field("#text_in", buff);
+	}
+	else if (!strcmp(exec, "WIFI_SSID")){
+		strncpy(wifi_ssid_pending, args, sizeof(wifi_ssid_pending)-1);
+		wifi_ssid_pending[sizeof(wifi_ssid_pending)-1] = 0;
+		printf("WiFi SSID set to: %s\n", wifi_ssid_pending);
+	}
+	else if (!strcmp(exec, "WIFI_PASS")){
+		strncpy(wifi_pass_pending, args, sizeof(wifi_pass_pending)-1);
+		wifi_pass_pending[sizeof(wifi_pass_pending)-1] = 0;
+		printf("WiFi password set (hidden)\n");
+	}
+	else if (!strcmp(exec, "WIFI_SAVE")){
+		wifi_connect();
+	}
+	else if (!strcmp(exec, "WIFI_SCAN")){
+		wifi_scan();
+		zbitx_send_wifi_ip();
+	}
+	else if (!strcmp(exec, "WIFI_OFF")){
+		wifi_off();
 	}
 	else {
 		char field_name[32];
